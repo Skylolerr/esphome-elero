@@ -138,7 +138,12 @@ void Elero::interpret_msg() {
   rx.num_dests = 0;
   rx.is_own_echo = false;
   if (packet.is_command) {
-    rx.is_own_echo = (this->own_remote_addresses_.count(packet.src) > 0);
+    // The CC1101 never receives its own transmission, and configured remote
+    // addresses are usually cloned from the user's physical hand-held remotes.
+    // Classifying those packets as "own echo" suppressed the immediate status
+    // poll after a hand-held remote was used. Relayed copies of our own packets
+    // only cause an extra, rate-limited CHECK, which is harmless.
+    rx.is_own_echo = false;
     rx.num_dests = (packet.num_dests > packet_parser::MAX_DESTS) ? packet_parser::MAX_DESTS : packet.num_dests;
     for (uint8_t i = 0; i < rx.num_dests; i++) {
       rx.dest_addrs[i] = packet.dest_addrs[i];

@@ -14,6 +14,10 @@ add_executable(test_cover_logic test_cover_logic.cpp)
 target_link_libraries(test_cover_logic GTest::gtest_main)
 add_test(NAME CoverLogicTests COMMAND test_cover_logic)
 
+add_executable(test_movement_guard test_movement_guard.cpp)
+target_link_libraries(test_movement_guard GTest::gtest_main)
+add_test(NAME MovementGuardTests COMMAND test_movement_guard)
+
 add_executable(test_light_logic test_light_logic.cpp)
 target_link_libraries(test_light_logic GTest::gtest_main)
 add_test(NAME LightLogicTests COMMAND test_light_logic)

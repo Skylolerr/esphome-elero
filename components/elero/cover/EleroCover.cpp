@@ -1,6 +1,7 @@
 #include "EleroCover.h"
 #include "../elero_cover_logic.h"
 #include "../elero_timed_action.h"
+#include "../elero_movement_guard.h"
 #include "esphome/core/log.h"
 #include <cmath>
 
@@ -106,6 +107,8 @@ void EleroCover::loop() {
       this->fail_stop_verification_(now);
     }
   }
+
+  this->process_movement_verification_(now);
 
   if (!this->stop_verification_active_.load())
     this->delivery_.release_deferred();
@@ -318,6 +321,7 @@ IntentSubmitResult EleroCover::request_stop(bool already_admitted) {
   if (this->current_operation != COVER_OPERATION_IDLE && !this->pending_movement_start_ &&
       this->open_duration_ > 0 && this->close_duration_ > 0)
     this->recompute_position();
+  this->clear_movement_verification_();
   this->stop_trigger_position_ = this->position;
   this->stop_trigger_ms_ = now;
   this->stop_verify_stop_retries_ = 0;
@@ -375,6 +379,24 @@ void EleroCover::apply_rx_state_(uint8_t state, const RxMetadata &meta) {
   this->last_state_raw_ = state;
   ESP_LOGV(TAG, "Got state: 0x%02x (%s) for blind 0x%06lx", state, elero_state_to_string(state),
            static_cast<unsigned long>(this->command_.blind_addr));
+
+  // Movement guard: right after a movement command the motor still reports its
+  // previous state (e.g. TOP before it starts closing). Such a reply must not
+  // cancel movement tracking, otherwise the target STOP is never sent.
+  const auto mv_dir = static_cast<movement_guard::Direction>(this->mv_direction_);
+  if (!this->stop_verification_active_.load() &&
+      this->current_operation != COVER_OPERATION_IDLE && mv_dir != movement_guard::Direction::NONE) {
+    if (movement_guard::confirms(mv_dir, state)) {
+      this->mv_confirmed_ = true;
+    } else if (movement_guard::contradicts(mv_dir, state) &&
+               movement_guard::guard_active(millis(), this->mv_command_ms_, this->pending_movement_start_,
+                                            this->mv_verify_at_ != 0)) {
+      ESP_LOGD(TAG, "Blind 0x%06lx: ignoring status %s during %s movement guard",
+               static_cast<unsigned long>(this->command_.blind_addr), elero_state_to_string(state),
+               mv_dir == movement_guard::Direction::UP ? "up" : "down");
+      return;
+    }
+  }
   float pos = this->position;
   float current_tilt = this->tilt;
   CoverOperation op = this->current_operation;
@@ -598,6 +620,14 @@ void EleroCover::apply_movement_state_(CoverOperation dir) {
   this->current_operation = dir;
   this->position_trusted_for_redundancy_ = false;
   this->pending_movement_start_ = true;
+  // Guard the queued command already: a CHECK reply received before the
+  // movement packet is transmitted must not reset the commanded operation.
+  if (dir != COVER_OPERATION_IDLE) {
+    this->mv_direction_ = static_cast<uint8_t>(dir == COVER_OPERATION_OPENING ? movement_guard::Direction::UP
+                                                                              : movement_guard::Direction::DOWN);
+    this->mv_resending_ = false;
+    this->mv_verify_at_ = 0;
+  }
   this->movement_start_ = 0;
   this->last_recompute_time_ = 0;
   this->post_movement_poll_at_ = 0;
@@ -605,6 +635,7 @@ void EleroCover::apply_movement_state_(CoverOperation dir) {
 }
 
 void EleroCover::begin_movement_tracking_(CoverOperation operation, uint32_t now) {
+  this->arm_movement_verification_(operation, now);
   this->current_operation = operation;
   this->position_trusted_for_redundancy_ = false;
   this->movement_start_ = now;
@@ -765,6 +796,104 @@ void EleroCover::recompute_position() {
                                                    ELERO_TIMEOUT_MOVEMENT);
 
   this->last_recompute_time_ = now;
+}
+
+
+// ---------------------------------------------------------------------------
+// Movement verification: confirm that the motor actually moves after a
+// movement command; resend a bounded number of times if it does not.
+// ---------------------------------------------------------------------------
+void EleroCover::arm_movement_verification_(CoverOperation operation, uint32_t now) {
+  if (operation == COVER_OPERATION_IDLE) {
+    this->clear_movement_verification_();
+    return;
+  }
+  const auto dir = operation == COVER_OPERATION_OPENING ? movement_guard::Direction::UP
+                                                        : movement_guard::Direction::DOWN;
+  if (this->mv_resending_ && this->mv_direction_ == static_cast<uint8_t>(dir)) {
+    // The motor did not move: restart dead reckoning from the original position.
+    this->position = this->mv_start_position_;
+  } else {
+    this->mv_resends_ = 0;
+    this->mv_start_position_ = this->position;
+  }
+  this->mv_resending_ = false;
+  this->mv_direction_ = static_cast<uint8_t>(dir);
+  this->mv_command_ms_ = now != 0 ? now : 1;
+  this->mv_confirmed_ = false;
+  this->mv_polled_ = false;
+  this->mv_verify_at_ = this->mv_command_ms_ + movement_guard::VERIFY_DELAY_MS;
+  if (this->mv_verify_at_ == 0)
+    this->mv_verify_at_ = 1;
+}
+
+void EleroCover::clear_movement_verification_() {
+  this->mv_verify_at_ = 0;
+  this->mv_direction_ = static_cast<uint8_t>(movement_guard::Direction::NONE);
+  this->mv_confirmed_ = false;
+  this->mv_polled_ = false;
+  this->mv_resending_ = false;
+}
+
+void EleroCover::process_movement_verification_(uint32_t now) {
+  if (this->mv_verify_at_ == 0)
+    return;
+  if (this->stop_verification_active_.load() || this->current_operation == COVER_OPERATION_IDLE) {
+    this->clear_movement_verification_();
+    return;
+  }
+  if (this->pending_movement_start_ || static_cast<int32_t>(now - this->mv_verify_at_) < 0)
+    return;
+
+  const auto dir = static_cast<movement_guard::Direction>(this->mv_direction_);
+  switch (movement_guard::next_verify_action(this->mv_confirmed_, this->mv_polled_, this->mv_resends_)) {
+    case movement_guard::VerifyAction::DONE:
+      ESP_LOGD(TAG, "Blind 0x%06lx: movement confirmed", static_cast<unsigned long>(this->command_.blind_addr));
+      this->mv_verify_at_ = 0;  // keep direction: late contradicting frames are handled normally
+      break;
+    case movement_guard::VerifyAction::POLL:
+      if (intent_was_accepted(this->delivery_.submit({CommandIntentKind::CHECK, 0}, now))) {
+        this->mv_polled_ = true;
+        this->last_poll_ = now;
+      }
+      this->mv_verify_at_ = now + movement_guard::VERIFY_POLL_WAIT_MS;
+      break;
+    case movement_guard::VerifyAction::RESEND: {
+      const CommandIntentKind kind =
+          dir == movement_guard::Direction::UP ? CommandIntentKind::OPEN : CommandIntentKind::CLOSE;
+      this->mv_resends_++;
+      ESP_LOGW(TAG, "Blind 0x%06lx: movement not confirmed, resending %s (#%d)",
+               static_cast<unsigned long>(this->command_.blind_addr),
+               kind == CommandIntentKind::OPEN ? "OPEN" : "CLOSE", this->mv_resends_);
+      if (intent_was_accepted(this->delivery_.submit({kind, 0}, now))) {
+        this->mv_resending_ = true;
+        this->pending_movement_start_ = true;
+        this->pending_movement_kind_ = kind;
+        this->mv_verify_at_ = 0;  // re-armed by begin_movement_tracking_ on transmission
+#ifdef USE_TEXT_SENSOR
+        this->parent_->publish_text_sensor_state(this->command_.blind_addr, "move_resent");
+#endif
+      } else {
+        this->mv_verify_at_ = now + movement_guard::VERIFY_POLL_WAIT_MS;
+      }
+      break;
+    }
+    case movement_guard::VerifyAction::GIVE_UP:
+      ESP_LOGW(TAG, "Blind 0x%06lx: movement not confirmed after %d resends",
+               static_cast<unsigned long>(this->command_.blind_addr), movement_guard::MAX_RESENDS);
+      this->clear_movement_verification_();
+      this->position = this->mv_start_position_;
+      this->position_trusted_for_redundancy_ = false;
+      this->current_operation = COVER_OPERATION_IDLE;
+      this->post_movement_poll_at_ = 0;
+      this->publish_state();
+#ifdef USE_TEXT_SENSOR
+      this->parent_->publish_text_sensor_state(this->command_.blind_addr, "move_failed");
+#endif
+      break;
+    case movement_guard::VerifyAction::NONE:
+      break;
+  }
 }
 
 } // namespace elero

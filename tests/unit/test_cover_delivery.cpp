@@ -258,3 +258,81 @@ TEST_F(CoverDeliveryTest, ConcurrentSameProfileStopPreservesBothTwoPacketBursts)
   EXPECT_EQ(hub.packets[2].dest_addrs[0], 0x222222u);
   EXPECT_EQ(hub.packets[2].counter, hub.packets[3].counter);
 }
+
+// ─── Movement guard / verification ──────────────────────────────────────────
+
+TEST_F(CoverDeliveryTest, StaleTopReplyAfterCloseDoesNotCancelMovement) {
+  cover.set_open_duration(36000);
+  cover.set_close_duration(32000);
+  transmit(1001);  // setup's initial CHECK
+  cover.set_rx_status(ELERO_STATE_TOP, fresh());
+  ASSERT_EQ(cover.current_operation, COVER_OPERATION_IDLE);
+  ASSERT_FLOAT_EQ(cover.position, COVER_OPEN);
+
+  CoverCall close; close.position = 0.2f; cover.control(close);
+  transmit(test_now + 5);
+  ASSERT_EQ(cover.current_operation, COVER_OPERATION_CLOSING);
+
+  // The motor answers the command with its pre-movement state.
+  cover.set_rx_status(ELERO_STATE_TOP, fresh());
+  EXPECT_EQ(cover.current_operation, COVER_OPERATION_CLOSING);
+  cover.set_rx_status(ELERO_STATE_MOVING_DOWN, fresh());
+  EXPECT_EQ(cover.current_operation, COVER_OPERATION_CLOSING);
+}
+
+TEST_F(CoverDeliveryTest, BlockingIsNeverIgnoredByMovementGuard) {
+  transmit(1001);
+  CoverCall close; close.position = COVER_CLOSED; cover.control(close);
+  transmit(1010);
+  cover.set_rx_status(ELERO_STATE_BLOCKING, fresh());
+  EXPECT_EQ(cover.current_operation, COVER_OPERATION_IDLE);
+}
+
+TEST_F(CoverDeliveryTest, UnconfirmedMovementIsPolledThenResent) {
+  transmit(1001);
+  CoverCall close; close.position = COVER_CLOSED; cover.control(close);
+  transmit(1010);
+  const size_t after_close = hub.packets.size();
+  ASSERT_EQ(hub.packets.back().payload[4], 0x40);
+
+  test_now = 1011 + 2500; cover.loop();  // verification poll
+  transmit(test_now + 1);
+  ASSERT_EQ(hub.packets.size(), after_close + 1);
+  EXPECT_EQ(hub.packets.back().payload[4], 0x00);
+
+  test_now += 1600; cover.loop();        // still no confirmation -> resend
+  EXPECT_EQ(hub.status, "move_resent");
+  transmit(test_now + 1);
+  ASSERT_EQ(hub.packets.size(), after_close + 2);
+  EXPECT_EQ(hub.packets.back().payload[4], 0x40);
+  EXPECT_NE(hub.packets.back().counter, hub.packets[after_close - 1].counter);
+  EXPECT_EQ(cover.current_operation, COVER_OPERATION_CLOSING);
+}
+
+TEST_F(CoverDeliveryTest, ConfirmedMovementIsNotResent) {
+  transmit(1001);
+  CoverCall close; close.position = COVER_CLOSED; cover.control(close);
+  transmit(1010);
+  const size_t after_close = hub.packets.size();
+  cover.set_rx_status(ELERO_STATE_MOVING_DOWN, fresh());
+  for (int i = 0; i < 4; i++) {
+    test_now += 1500; cover.loop();
+    const auto id = hub.advance(test_now);
+    if (id != 0) hub.complete(id, true, test_now + 1, timeline.fence(test_now + 1));
+  }
+  for (size_t i = after_close; i < hub.packets.size(); i++)
+    EXPECT_NE(hub.packets[i].payload[4], 0x40);  // only regular CHECKs, no resend
+}
+
+TEST_F(CoverDeliveryTest, MovementGivesUpVisiblyAfterBoundedResends) {
+  transmit(1001);
+  CoverCall close; close.position = COVER_CLOSED; cover.control(close);
+  transmit(1010);
+  for (int i = 0; i < 2 + 2 * 2; i++) {  // poll + resend cycles
+    test_now += 3000; cover.loop();
+    const auto id = hub.advance(test_now);
+    if (id != 0) hub.complete(id, true, test_now + 1, timeline.fence(test_now + 1));
+  }
+  EXPECT_EQ(cover.current_operation, COVER_OPERATION_IDLE);
+  EXPECT_EQ(hub.status, "move_failed");
+}

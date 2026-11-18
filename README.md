@@ -9,6 +9,14 @@
 
 ---
 
+> **Fork-Hinweis (Skylolerr):** Dieser Fork basiert auf [pfriedrich84/esphome-elero](https://github.com/pfriedrich84/esphome-elero) und enthält zusätzlich:
+> - **Movement Guard:** Statusmeldungen, die einem eben gesendeten Fahrbefehl widersprechen (Motor meldet direkt nach dem Befehl noch seinen alten Zustand), werden kurz ignoriert. Dadurch geht die Fahrt-Verfolgung nicht mehr verloren und der Stopp bei Zwischenpositionen wird zuverlässig gesendet.
+> - **Fahrt-Bestätigung:** Ca. 2,5 s nach einem Fahrbefehl wird geprüft, ob der Motor fährt; wenn nicht, wird bis zu zweimal nachgesendet (Textsensor `move_resent` / `move_failed`).
+> - **Handsender-Erkennung:** Befehle von Handsendern mit gleicher Adresse lösen wieder eine sofortige Statusabfrage aus.
+>
+> Lizenz unverändert GPLv3.
+
+
 ## Features
 
 | Feature | Status |

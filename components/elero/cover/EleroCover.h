@@ -147,6 +147,19 @@ class EleroCover : public cover::Cover, public Component, public EleroBlindBase 
   bool     position_trusted_for_redundancy_{false}; // true only for confirmed endpoint/explicit trusted estimates
   CommandIntentKind pending_movement_kind_{CommandIntentKind::OPEN};
   std::atomic<bool> stop_verification_active_{false};
+
+  // Movement guard / verification (see elero_movement_guard.h)
+  void arm_movement_verification_(cover::CoverOperation operation, uint32_t now);
+  void clear_movement_verification_();
+  void process_movement_verification_(uint32_t now);
+  uint32_t mv_command_ms_{0};      // last movement transmission (0 = none)
+  uint32_t mv_verify_at_{0};       // next verification step (0 = inactive)
+  uint8_t  mv_direction_{0};       // movement_guard::Direction
+  uint8_t  mv_resends_{0};         // resends of the current movement
+  bool     mv_confirmed_{false};   // motor reported consistent state
+  bool     mv_polled_{false};      // verification CHECK already sent
+  bool     mv_resending_{false};   // next tracking start is a resend
+  float    mv_start_position_{0};  // position estimate when the movement began
 };
 
 } // namespace elero
