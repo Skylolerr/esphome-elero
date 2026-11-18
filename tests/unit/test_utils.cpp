@@ -64,3 +64,10 @@ TEST(CalculateRssi, GoodSignal50) {
   // 50 (unsigned) → 50/2 + (-74) = -49.0
   EXPECT_FLOAT_EQ(calculate_rssi(50), 50.0f / 2.0f + (-74.0f));  // -49.0
 }
+
+TEST(HexPretty, FormatsLikeEsphomeHelper) {
+  const uint8_t data[] = {0x1D, 0x0A, 0xFF};
+  EXPECT_EQ(esphome::elero::utils::hex_pretty(data, 3), "1D.0A.FF (3)");
+  EXPECT_EQ(esphome::elero::utils::hex_pretty(data, 0), "");
+  EXPECT_EQ(esphome::elero::utils::hex_pretty(nullptr, 3), "");
+}
